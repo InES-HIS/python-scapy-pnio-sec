@@ -13,13 +13,19 @@ PNIO RPC endpoints
 import struct
 from uuid import UUID
 
-from scapy.packet import Packet, Raw, bind_layers
+from scapy.packet import Packet, Raw, Padding, bind_layers
 from scapy.config import conf
 from scapy.fields import BitField, ByteField, BitEnumField, ByteEnumField, \
     ConditionalField, FieldLenField, FieldListField, IntField, IntEnumField, \
     LenField, MACField, PadField, PacketField, PacketListField, \
     ShortEnumField, ShortField, StrFixedLenField, StrLenField, \
-    UUIDField, XByteField, XIntField, XShortEnumField, XShortField
+    UUIDField, XByteField, XIntField, XShortEnumField, XShortField, \
+    XStrLenField, MultipleTypeField, PacketLenField, XByteEnumField
+from scapy.layers.eap import EAP
+from scapy.layers.eap import EAP_TLS
+from scapy.layers.tls.record import TLS
+from scapy.layers.eap import eap_codes
+from scapy.layers.eap import eap_types
 from scapy.layers.dcerpc import DceRpc4, DceRpc4Payload
 from scapy.contrib.rtps.common_types import EField
 from scapy.compat import bytes_hex
@@ -60,6 +66,7 @@ BLOCK_TYPES_ENUM = {
     0x0109: "IRInfoBlock",
     0x010a: "SRInfoBlock",
     0x010b: "ARFSUBlock",
+    0x010D: "ARAlgorithmInfoBlock",
     0x0110: "IODBlockReq_connect_end",
     0x0111: "IODBlockReq_plug",
     0x0112: "IOXBlockReq_connect",
@@ -69,6 +76,7 @@ BLOCK_TYPES_ENUM = {
     0x0117: "IOXBlockReq_rt_class_3",
     0x0118: "IODBlockReq_connect_begin",
     0x0119: "SubmoduleListBlock",
+    0x011A: "SecurityRequestBlock",
     0x0200: "PDPortDataCheck",
     0x0201: "PdevData",
     0x0202: "PDPortDataAdjust",
@@ -154,6 +162,23 @@ BLOCK_TYPES_ENUM = {
     0x8116: "IOXBlockRes_companion",
     0x8117: "IOXBlockRes_rt_class_3",
     0x8118: "IODBlockRes_connect_begin",
+    0x811A: "SecurityResponseBlock"
+}
+
+SECURITY_OPERATIONS_ENUM = {
+    0x0001: 'Get_Security_Capabilities',
+    0x0002: 'Get_Available_CredentialIDs',
+    0x0003: 'Get_Security_Mode',
+    0x0004: 'Get_EE_Certification_Path',
+    0x0005: 'Get_Trusted_CA_Certificate',
+    0x0006: 'Trigger_Key_Pair_Generation',
+    0x0007: 'Imprint_Private_Key',
+    0x0008: 'Imprint_EE_Certification_Path',
+    0x0009: 'Remove_EE_Certification_Path_and_Private_Key',
+    0x000A: 'Imprint Trusted CA Certificate',
+    0x000B: 'Remove Trusted CA Certificate',
+    0x000C: 'Set_Security_Mode',
+    0x0100: 'Process_EAP_Message'
 }
 
 # IODWriteReq & IODWriteMultipleReq Packets
@@ -305,6 +330,46 @@ MEDIA_TYPE = {
     0x03: "Radio communication"
 }
 
+SECURITY_CAPABILITY_USAGE = {
+    0x00: 'Not applicable for the desired communication protocol',
+    0x01: 'Symmetric, authentication only',
+    0x02: 'Symmetric, authentication encryption',
+    0x03: 'Key derivation function',
+    0x04: 'Key agreement function',
+    0x05: 'Digital signature function'
+}
+
+SECURITY_CAPABILITY_ALGORITHM = {
+    0x00: 'AEAD_AES_128_GCM',
+    0x01: 'AEAD_AES_256_GCM',
+    0x02: 'AEAD_CHACHA20_POLY1305'
+}
+
+SECURITY_CAPABILITY_KEY_DRV_FUNC = {
+    0x00: 'HKDF together with SHA-256'
+}
+
+SECURITY_CAPABILITY_KEY_AGREE_FUNC = {
+    0x00: 'X25519',
+    0x01: 'X448'
+}
+
+SECURITY_CAPABILITY_SIG_FUNC = {
+    0x00: 'Ed25519',
+    0x01: 'Ed448',
+    0x02: 'P-256',
+    0x03: 'P-521'
+}
+
+# Unit is bytes
+SHORT_WIDTH: int = 2
+
+# Source: Existing captures
+PNIO_SERVICE_PDU_MAX_COUNT: int = 16696
+
+# Unit is bytes
+BLK_HDR_LEN: int = int( 2 + 2 + 1 + 1 )
+
 # List of all valid activity UUIDs for the DceRpc layer with PROFINET RPC
 # endpoint.
 #
@@ -319,6 +384,18 @@ RPC_INTERFACE_UUID = {
     "UUID_IO_ParameterServerInterface":
         UUID("dea00004-6c97-11d1-8271-00a02442df7d"),
 }
+
+
+def get_dict_key_by_name( d: dict[ int, str ], name: str ) -> int:
+    ret = 0
+    try:
+        key = \
+            [ x for ( x, y ) in d.items()
+              if y == name ][ 0 ]
+        ret = int( key )
+    except ( IndexError, ValueError, Exception ) as e:
+        print( e, file = sys.stderr )
+    return ret
 
 
 # Generic Block Packet
@@ -774,7 +851,12 @@ class IM4Block(Block):
 
 #     ARBlockRe{q,s}
 class ARBlockReq(Block):
-    """Application relationship block request"""
+    """
+    Application relationship block request
+    AR Properties bitfields have changed
+    a little, so we define them according
+    to 2.4MU4 (November 2022) here.
+    """
     fields_desc = [
         BlockHeader,
         XShortEnumField("ARType", 1, AR_TYPE),
@@ -782,22 +864,52 @@ class ARBlockReq(Block):
         ShortField("SessionKey", 0),
         MACField("CMInitiatorMacAdd", None),
         UUIDField("CMInitiatorObjectUUID", None),
-        # ARProperties
-        BitField("ARProperties_PullModuleAlarmAllowed", 0, 1),
-        BitEnumField("ARProperties_StartupMode", 0, 1,
-                     ["Legacy", "Advanced"]),
-        BitField("ARProperties_reserved_3", 0, 6),
-        BitField("ARProperties_reserved_2", 0, 12),
-        BitField("ARProperties_AcknowledgeCompanionAR", 0, 1),
-        BitEnumField("ARProperties_CompanionAR", 0, 2,
-                     ["Single_AR", "First_AR", "Companion_AR", "reserved"]),
-        BitEnumField("ARProperties_DeviceAccess", 0, 1,
-                     ["ExpectedSubmodule", "Controlled_by_IO_device_app"]),
-        BitField("ARProperties_reserved_1", 0, 3),
-        BitEnumField("ARProperties_ParametrizationServer", 0, 1,
-                     ["External_PrmServer", "CM_Initator"]),
-        BitField("ARProperties_SupervisorTakeoverAllowed", 0, 1),
-        BitEnumField("ARProperties_State", 1, 3, {1: "Active"}),
+        # ARProperties (32 bit, 4 byte).
+        # LSB is bit 0 of ARProperties_State.
+        BitField(     'ARProperties_PullModuleAlarmAllowed',
+                      0, 1 ),
+        BitEnumField( 'ARProperties_StartupMode',
+                      0, 1, [ 'Legacy',
+                              'Advanced' ] ),
+        BitEnumField( 'ARProperties_CombinedObjectContainer',
+                      0, 1, [ 'NoCOC',
+                              'COC' ] ),
+        BitEnumField( 'ARProperties_TimeAwareSystem',
+                      0, 1, [ 'NonTimeAware',
+                              'TimeAware' ] ),
+        BitEnumField( 'ARProperties_RejectDCPsetRequests',
+                      0, 1, [ 'Accepted',
+                              'Rejected' ] ),
+        BitField(     'ARProperties_reserved_3',
+                      0, 3 ),
+        BitField(     'ARProperties_reserved_2',
+                      0, 12 ),
+        BitField(     'ARProperties_AcknowledgeCompanionAR',
+                      0, 1 ),
+        BitEnumField( 'ARProperties_CompanionAR',
+                      0, 2, [ 'Single_AR',
+                              'First_AR',
+                              'Companion_AR',
+                              'reserved' ] ),
+        BitEnumField( 'ARProperties_DeviceAccess',
+                      0, 1, [ 'ExpectedSubmodule',
+                              'Controlled_by_IO_device_app' ] ),
+        BitField(     'ARProperties_reserved_1',
+                      0, 1 ),
+        BitEnumField( 'ARProperties_ProtectionProperties',
+                      0, 2, [ 'None',
+                              'Authentication',
+                              ( 'Authentication for RTC/RTA, ' +
+                                'Authenticated encryption ' +
+                                'for RSI/RPC' ),
+                              'Authenticated encryption' ] ),
+        BitEnumField( 'ARProperties_ParametrizationServer',
+                      0, 1, [ 'External_PrmServer',
+                              'CM_Initiator' ] ),
+        BitField(     'ARProperties_SupervisorTakeoverAllowed',
+                      0, 1 ),
+        BitEnumField( 'ARProperties_State',
+                      1, 3, { 1: 'Active' } ),
         ShortField("CMInitiatorActivityTimeoutFactor", 1000),
         ShortField("CMInitiatorUDPRTPort", 0x8892),
         FieldLenField("StationNameLength", None, fmt="H",
@@ -830,6 +942,481 @@ class ARBlockRes(Block):
     ]
     # default block_type value
     block_type = 0x8101
+
+
+class SecurityOperation( Packet ):
+    fields_desc = [
+        ShortEnumField( 'security_operation',
+                        get_dict_key_by_name(
+                            SECURITY_OPERATIONS_ENUM,
+                            'Process_EAP_Message'
+                        ),
+                        SECURITY_OPERATIONS_ENUM )
+    ]
+
+
+class SecurityCapability( Packet ):
+    fields_desc = [
+        XByteEnumField( 'usage', None,
+                        SECURITY_CAPABILITY_USAGE )
+    ]
+
+    def guess_payload_class( self, payload: bytes ) -> type:
+        return Padding
+
+
+class SecCapaSymAuthEnc( SecurityCapability ):
+    fields_desc = [
+        XByteEnumField( 'algorithm', None,
+                        SECURITY_CAPABILITY_ALGORITHM )
+    ] + SecurityCapability.fields_desc
+
+
+class SecCapaKeyDrvFunc( SecurityCapability ):
+    fields_desc = [
+        XByteEnumField( 'algorithm', None,
+                        SECURITY_CAPABILITY_KEY_DRV_FUNC )
+    ] + SecurityCapability.fields_desc
+
+
+class SecCapaKeyAgreeFunc( SecurityCapability ):
+    fields_desc = [
+        XByteEnumField( 'algorithm', None,
+                        SECURITY_CAPABILITY_KEY_AGREE_FUNC )
+    ] + SecurityCapability.fields_desc
+
+
+class SecCapaKeySigFunc( SecurityCapability ):
+    fields_desc = [
+        XByteEnumField( 'algorithm', None,
+                        SECURITY_CAPABILITY_SIG_FUNC )
+    ] + SecurityCapability.fields_desc
+
+
+class ARAlgorithmInfoBlock( Block ):
+    fields_desc = [
+        BlockHeader,
+        XByteField( 'padding_0', 0 ),
+        XByteField( 'padding_1', 0 ),
+        PacketField( 'rtc_algo',
+                     SecCapaSymAuthEnc(
+                        usage = get_dict_key_by_name(
+                            SECURITY_CAPABILITY_USAGE,
+                            'Symmetric, authentication only' ),
+                        algorithm = get_dict_key_by_name(
+                            SECURITY_CAPABILITY_ALGORITHM,
+                            'AEAD_AES_128_GCM' ) ),
+                     SecCapaSymAuthEnc ),
+        PacketField( 'rta_algo',
+                     SecCapaSymAuthEnc(
+                        usage = get_dict_key_by_name(
+                            SECURITY_CAPABILITY_USAGE,
+                            'Symmetric, authentication only' ),
+                        algorithm = get_dict_key_by_name(
+                            SECURITY_CAPABILITY_ALGORITHM,
+                            'AEAD_AES_128_GCM' ) ),
+                     SecCapaSymAuthEnc ),
+        PacketField( 'rpc_algo',
+                     SecCapaSymAuthEnc(
+                        usage = get_dict_key_by_name(
+                            SECURITY_CAPABILITY_USAGE,
+                            'Symmetric, authentication encryption' ),
+                        algorithm = get_dict_key_by_name(
+                            SECURITY_CAPABILITY_ALGORITHM,
+                            'AEAD_AES_128_GCM' ) ),
+                     SecCapaSymAuthEnc ),
+        PacketField( 'derivation_algo',
+                     SecCapaKeyDrvFunc(
+                        usage = get_dict_key_by_name(
+                            SECURITY_CAPABILITY_USAGE,
+                            'Key derivation function' ),
+                        algorithm = get_dict_key_by_name(
+                            SECURITY_CAPABILITY_KEY_DRV_FUNC,
+                            'HKDF together with SHA-256' ) ),
+                     SecCapaKeyDrvFunc ),
+        PacketField( 'agreement_algo',
+                     SecCapaKeyAgreeFunc(
+                        usage = get_dict_key_by_name(
+                            SECURITY_CAPABILITY_USAGE,
+                            'Key agreement function' ),
+                        algorithm = get_dict_key_by_name(
+                            SECURITY_CAPABILITY_KEY_AGREE_FUNC,
+                            'X25519' ) ),
+                     SecCapaKeyAgreeFunc ),
+        PacketField( 'signature_algo',
+                     SecCapaKeySigFunc(
+                        usage = get_dict_key_by_name(
+                            SECURITY_CAPABILITY_USAGE,
+                            'Digital signature function' ),
+                        algorithm = get_dict_key_by_name(
+                            SECURITY_CAPABILITY_SIG_FUNC,
+                            'Ed25519' ) ),
+                     SecCapaKeySigFunc )
+    ]
+    block_type = get_dict_key_by_name(
+        BLOCK_TYPES_ENUM,
+        'ARAlgorithmInfoBlock' )
+
+    def __init__( self,
+                  *args: tuple[ object ],
+                  **kwargs: dict[ str, object ] ) -> None:
+        super().__init__( *args, **kwargs )
+        if len( args ) == 1 and \
+           len( kwargs ) == 0:
+            if type( args[ 0 ] ) is bytes:
+                return
+        blk_len: int = 0
+        # Block header minus
+        # block_type width and block_length width.
+        blk_len += ( BLK_HDR_LEN - ( 2 + 2 ) )
+        # Two padding bytes, padding_0 and padding_1.
+        blk_len += ( 1 + 1 )
+        if self.rtc_algo:
+            blk_len += len( self.rtc_algo )
+        if self.rta_algo:
+            blk_len += len( self.rta_algo )
+        if self.rpc_algo:
+            blk_len += len( self.rpc_algo )
+        if self.derivation_algo:
+            blk_len += len( self.derivation_algo )
+        if self.agreement_algo:
+            blk_len += len( self.agreement_algo )
+        if self.signature_algo:
+            blk_len += len( self.signature_algo )
+        self.block_length = blk_len
+
+
+def get_pad_len_sec_blk( pkt: Packet ) -> int:
+    blk_hdr_len: int = BLK_HDR_LEN
+    sec_op_width: int = 2
+    if pkt.eap_data:
+        eap_data_len: int = len( pkt.eap_data )
+    else:
+        eap_data_len: int = 0
+    pad_len: int = ( ( blk_hdr_len +
+                       sec_op_width +
+                       eap_data_len ) % 4 )
+    if pad_len:
+        pad_len = ( 4 - pad_len )
+    return pad_len
+
+
+def sec_blk_cond_for_eap(
+        pkt_bytes: bytes,
+        eap_start_idx: int = 8 ) -> bool:
+    # Default value (8) of eap_start_idx is
+    # from the viewpoint of a security block.
+
+    if len( pkt_bytes ) <= eap_start_idx:
+        return False
+
+    try:
+        # EAP Codes ...
+        is_req: bool = \
+            ( pkt_bytes[ eap_start_idx ] ==
+              get_dict_key_by_name( eap_codes, 'Request' ) )
+        is_res: bool = \
+            ( pkt_bytes[ eap_start_idx ] ==
+              get_dict_key_by_name( eap_codes, 'Response' ) )
+        is_succ: bool = \
+            ( pkt_bytes[ eap_start_idx ] ==
+              get_dict_key_by_name( eap_codes, 'Success' ) )
+        is_fail: bool = \
+            ( pkt_bytes[ eap_start_idx ] ==
+              get_dict_key_by_name( eap_codes, 'Failure' ) )
+
+        # These have no type field and are therefore
+        # EAP messages, decidable at this point already.
+        if is_succ or is_fail:
+            return True
+
+        if len( pkt_bytes ) <= ( eap_start_idx + 4 ):
+            return False
+
+        # EAP Types ...
+        is_ident: bool = ( pkt_bytes[ eap_start_idx + 4 ] ==
+                           get_dict_key_by_name( eap_types,
+                                                 'Identity' ) )
+
+        if is_req or is_res:
+            # More types to be attached here through
+            # logical OR expressions. Currently we
+            # only have ident requests.
+            if is_ident:
+                return True
+
+    except ( IndexError, Exception ) as e:
+        print( ( 'Something went wrong while trying to ' +
+                 'decice whether if it is a EAP or EAP_TLS packet.' ),
+               file = sys.stderr )
+        print( e )
+
+    return False
+
+
+def sec_blk_cond_for_eap_tls(
+        pkt_bytes: bytes,
+        eap_start_idx: int = 8 ) -> bool:
+    # Default value (8) of eap_start_idx is
+    # from the viewpoint of a security block.
+    ret_val: bool = False
+    is_eap_tls: bool = False
+
+    ret_val = not sec_blk_cond_for_eap(
+                pkt_bytes,
+                eap_start_idx = eap_start_idx )
+
+    if len( pkt_bytes ) <= eap_start_idx:
+        return False
+
+    if ret_val:
+        try:
+            is_eap_tls = ( pkt_bytes[ eap_start_idx + 4 ] ==
+                           get_dict_key_by_name( eap_types,
+                                                 'EAP-TLS' ) )
+        except ( IndexError, Exception ) as e:
+            print( ( 'Something went wrong while trying to ' +
+                     'decice whether if it is a EAP or ' +
+                     'EAP_TLS packet.' ),
+                   file = sys.stderr )
+            print( e )
+
+    ret_val = ( ret_val and is_eap_tls )
+    return ret_val
+
+
+def sec_blk_len_adjust( pkt: Packet, initial_len: int ) -> int:
+    ret_val: int = 0
+
+    if pkt.padding is None:
+        # Block version low and version high [bytes].
+        # Security operation width [bytes].
+        ret_val += ( initial_len + ( 1 + 1 + 2 ) )
+    else:
+        # Padding length [bytes]
+        # Block version low and version high [bytes].
+        # Security operation width [bytes].
+        ret_val += ( initial_len +
+                     len( pkt.padding ) +
+                     ( 1 + 1 + 2 ) )
+    return ret_val
+
+
+class SecBlkHeader( BlockHeader ):
+    fields_desc = [
+        BlockHeader.fields_desc[ 0 ],
+        FieldLenField( 'block_length', None,
+                       fmt = '!H',
+                       length_of = 'eap_data',
+                       adjust = sec_blk_len_adjust )
+        ] + BlockHeader.fields_desc[ 2 : ] + \
+        [ SecurityOperation ]
+
+
+def sec_blk_len_dissect( pkt: Packet ) -> int:
+    ret_val: int = 0
+    ret_val = pkt.get_eap_data_len()
+    return ret_val
+
+
+class SecurityBlock( Block ):
+    fields_desc = [
+        SecBlkHeader,
+        MultipleTypeField(
+            [
+                (
+                    PacketLenField(
+                        'eap_data',
+                        None,
+                        EAP,
+                        length_from = sec_blk_len_dissect
+                    ),
+                    lambda pkt: pkt.get_eap_data_type() == EAP
+                ),
+                (
+                    PacketLenField(
+                        'eap_data',
+                        None,
+                        EAP_TLS,
+                        length_from = sec_blk_len_dissect
+                    ),
+                    lambda pkt: pkt.get_eap_data_type() == EAP_TLS
+                ),
+                (
+                    PacketLenField(
+                        'eap_data',
+                        None,
+                        None,
+                        length_from = sec_blk_len_dissect
+                    ),
+                    lambda pkt: pkt.get_eap_data_type() is None
+                )
+            ],
+            PacketLenField(
+                'eap_data',
+                None,
+                conf.raw_layer,
+                length_from = sec_blk_len_dissect
+            )
+        ),
+        PadField(
+            XStrLenField(
+                'padding',
+                None,
+                length_from = get_pad_len_sec_blk
+            ),
+            1,
+            padwith = b'\x00'
+        )
+    ]
+
+    def __init__( self,
+                  *args: tuple[ object ],
+                  **kwargs: dict[ str, object ] ) -> None:
+        super().__init__( *args, **kwargs )
+        self.__eap_data_len: int = 0
+        self.__eap_data_type: type = None
+        if self.eap_data is not None:
+            self.__pad()
+        else:
+            #
+            # Magic number 4 (bytes),
+            #
+            #   block header
+            # - block type witdth
+            # - block length field width
+            #
+            # -> 8 - 4
+            #    |
+            #    -> ( 2 + 2 + 1 + 1 + 2 ) - ( 2 + 2 )
+            #
+            self.block_length = 4
+
+    def get_eap_data_len( self ) -> int:
+        return self.__eap_data_len
+
+    def get_eap_data_type( self ) -> type:
+        return self.__eap_data_type
+
+    def set_eap_data( self, eap_data: EAP ) -> None:
+        self.eap_data = eap_data
+        self.__pad()
+
+    def pre_dissect( self, s: bytes ) -> bytes:
+        s = super().pre_dissect( s )
+        if len( s ) >= 12:
+            self.__eap_data_len = \
+                struct.unpack( '!H', s[ 10 : 12 ] )[ 0 ]
+        else:
+            self.__eap_data_len = 0
+
+        is_eap: bool = sec_blk_cond_for_eap( s )
+        is_eap_tls: bool = sec_blk_cond_for_eap_tls( s )
+
+        assert ( ( is_eap ^ is_eap_tls ) or
+                 ( not is_eap and not is_eap_tls ) )
+
+        if is_eap:
+            self.__eap_data_type = EAP
+        if is_eap_tls:
+            self.__eap_data_type = EAP_TLS
+
+        return s
+
+    def post_build( self, p: bytes, pay: bytes ) -> bytes:
+        p += pay
+        if self.block_length is None:
+            p = ( p[ : 2 ] +
+                  struct.pack( '!H', len( pay ) ) +
+                  p[ 4 : ] )
+        return p
+
+    def __pad( self ) -> None:
+        # Magic number 8: Block header fields:
+        # 2 + 2 + 1 + 1 + 2
+        mod: int = ( ( len( self.eap_data ) + 8 ) % 4 )
+        if ( mod != 0 ):
+            pad_len = ( 4 - mod )
+            self.padding = ( b'\x00' * pad_len )
+            self.block_length = \
+                ( 4 + len( self.eap_data ) + len( self.padding ) )
+        else:
+            self.block_length = \
+                ( 4 + len( self.eap_data ) )
+
+
+class SecurityRequestBlock( SecurityBlock ):
+    block_type = get_dict_key_by_name(
+        BLOCK_TYPES_ENUM,
+        'SecurityRequestBlock' )
+
+
+class SecurityResponseBlock( SecurityBlock ):
+    block_type = get_dict_key_by_name(
+        BLOCK_TYPES_ENUM,
+        'SecurityResponseBlock' )
+
+
+def get_pad_len_ar_srvr_blk_res( pkt: Packet ) -> int:
+    blk_hdr_len: int = BLK_HDR_LEN
+    len_width: int = 2
+    pad_len: int = ( ( blk_hdr_len +
+                       len_width +
+                       pkt.StationNameLength ) % 4 )
+    if pad_len:
+        pad_len = ( 4 - pad_len )
+    return pad_len
+
+
+class ARServerBlockRes( Block ):
+    fields_desc = [
+        BlockHeader,
+        FieldLenField( 'StationNameLength', None, fmt = '!H',
+                       length_of = 'CMInitiatorStationName' ),
+        StrLenField( 'CMInitiatorStationName', '',
+                     length_from =
+                     lambda pkt: pkt.StationNameLength ),
+        PadField(
+            XStrLenField(
+                'padding',
+                None,
+                length_from = get_pad_len_ar_srvr_blk_res
+            ),
+            1,
+            padwith = b'\x00'
+        )
+    ]
+    # default block_type value
+    block_type = get_dict_key_by_name( BLOCK_TYPES_ENUM,
+                                       'ARServerBlockRes' )
+
+    def __init__( self,
+                  *args: tuple[ object ],
+                  **kwargs: dict[ str, object ] ) -> None:
+        super().__init__( *args, **kwargs )
+        if 'CMInitiatorStationName' in kwargs:
+            if kwargs[ 'CMInitiatorStationName' ]:
+                self.StationNameLength = \
+                    len( kwargs[ 'CMInitiatorStationName' ] )
+                self.__pad()
+                blk_hdr_len: int = BLK_HDR_LEN
+                len_width: int = 2
+                self.block_length = \
+                    ( ( blk_hdr_len - ( 2 * SHORT_WIDTH ) ) +
+                      len_width +
+                      self.StationNameLength )
+                if self.padding:
+                    self.block_length += len( self.padding )
+
+    def __pad( self ) -> None:
+        blk_hdr_len: int = BLK_HDR_LEN
+        len_width: int = 2
+        pad_len: int = ( ( blk_hdr_len +
+                           len_width +
+                           self.StationNameLength ) % 4 )
+        if pad_len:
+            pad_len = ( 4 - pad_len )
+            self.padding = ( b'\x00' * pad_len )
 
 
 #     IOCRBlockRe{q,s}
@@ -1276,7 +1863,7 @@ class PRAL_AlarmItem(AlarmItem):
         XShortField("PRAL_Reason", 0),
         XShortField("PRAL_ExtReason", 0),
         StrLenField("PRAL_ReasonAddValue", "",
-                    length_from=lambda x:x.len - 10),
+                    length_from = lambda x : x.len - 10),
     ]
 
 
@@ -1393,6 +1980,7 @@ PNIO_RPC_BLOCK_ASSOCIATION = {
     "0102": IOCRBlockReq,
     "0103": AlarmCRBlockReq,
     "0104": ExpectedSubmoduleBlockReq,
+    "010d": ARAlgorithmInfoBlock,
     "0110": IODControlReq,
     "0111": IODControlReq,
     "0112": IODControlReq,
@@ -1401,12 +1989,14 @@ PNIO_RPC_BLOCK_ASSOCIATION = {
     "0116": IODControlReq,
     "0117": IODControlReq,
     "0118": IODControlReq,
+    "011a": SecurityRequestBlock,
     "0202": PDPortDataAdjust,
 
     # responses
     "8101": ARBlockRes,
     "8102": IOCRBlockRes,
     "8103": AlarmCRBlockRes,
+    "8106": ARServerBlockRes,
     "8110": IODControlRes,
     "8111": IODControlRes,
     "8112": IODControlRes,
@@ -1415,6 +2005,7 @@ PNIO_RPC_BLOCK_ASSOCIATION = {
     "8116": IODControlRes,
     "8117": IODControlRes,
     "8118": IODControlRes,
+    "811a": SecurityResponseBlock
 }
 
 
@@ -1500,7 +2091,9 @@ class PNIOServiceReqPDU(Packet):
     overload_fields = {
         DceRpc4: {
             # random object in the appropriate range
-            "object": RandUUID("dea00000-6c97-11d1-8271-******"),
+            "object": UUID( str(
+                RandUUID( "dea00000-6c97-11d1-8271-******" )
+            ) ),
             # interface uuid to send to a device
             "if_id": RPC_INTERFACE_UUID["UUID_IO_DeviceInterface"],
             # Request DCE/RPC type

@@ -12,12 +12,14 @@ from __future__ import print_function
 
 import struct
 
-from scapy.fields import BitField, ByteField, XByteField,\
-    ShortField, IntField, XIntField, ByteEnumField, StrLenField, XStrField,\
-    XStrLenField, XStrFixedLenField, LenField, FieldLenField, FieldListField,\
-    PacketField, PacketListField, ConditionalField, PadField
+from scapy.fields import BitField, ByteField, XByteField, \
+    ShortField, IntField, XIntField, ByteEnumField, StrLenField, XStrField, \
+    XStrLenField, XStrFixedLenField, LenField, FieldLenField, FieldListField, \
+    PacketField, PacketListField, ConditionalField, PadField, \
+    PacketLenField
 from scapy.packet import Packet, Padding, bind_layers
 from scapy.layers.l2 import SourceMACField, Ether, CookedLinux, GRE, SNAP
+from scapy.layers.tls.record import TLS
 from scapy.config import conf
 from scapy.compat import orb, chb
 
@@ -196,13 +198,13 @@ class EAP(Packet):
         ByteField("id", 0),
         ShortField("len", None),
         ConditionalField(ByteEnumField("type", 0, eap_types),
-                         lambda pkt:pkt.code not in [
+                         lambda pkt : pkt.code not in [
                              EAP.SUCCESS, EAP.FAILURE]),
         ConditionalField(
             FieldListField("desired_auth_types", [],
                            ByteEnumField("auth_type", 0, eap_types),
                            length_from=lambda pkt: pkt.len - 4),
-            lambda pkt:pkt.code == EAP.RESPONSE and pkt.type == 3),
+            lambda pkt : pkt.code == EAP.RESPONSE and pkt.type == 3),
         ConditionalField(
             StrLenField("identity", '', length_from=lambda pkt: pkt.len - 5),
             lambda pkt: pkt.code == EAP.RESPONSE and hasattr(pkt, 'type') and pkt.type == 1),  # noqa: E501
@@ -310,7 +312,14 @@ class EAP_TLS(EAP):
         BitField('S', 0, 1),
         BitField('reserved', 0, 5),
         ConditionalField(IntField('tls_message_len', 0), lambda pkt: pkt.L == 1),  # noqa: E501
-        XStrLenField('tls_data', '', length_from=lambda pkt: 0 if pkt.len is None else pkt.len - (6 + 4 * pkt.L))  # noqa: E501
+        PacketLenField(
+            'tls_data',
+            None,
+            TLS,
+            length_from = lambda pkt: \
+                            0 if pkt.len is None \
+                            else ( pkt.len - ( 6 + 4 * pkt.L ) )
+        )
     ]
 
 
